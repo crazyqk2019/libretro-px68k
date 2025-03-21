@@ -1,9 +1,11 @@
-// ---------------------------------------------------------------------------------------
-//  FDD.C - 内蔵FDD Unit（イメージファイルの管理とFD挿抜割り込みの発生）
-// ---------------------------------------------------------------------------------------
+/*
+ *  FDD.C - FDD Unit
+ */
+
+#include <string.h>
 
 #include "common.h"
-#include "fileio.h"
+#include "../libretro/dosio.h"
 #include "status.h"
 #include "irqh.h"
 #include "ioc.h"
@@ -12,8 +14,6 @@
 #include "disk_d88.h"
 #include "disk_xdf.h"
 #include "disk_dim.h"
-#include <string.h>
-
 
 typedef struct {
 	int SetDelay[4];
@@ -29,21 +29,42 @@ static int (*SetFD[4])(int, char*)                             = { 0, XDF_SetFD,
 static int (*Eject[4])(int)                                    = { 0, XDF_Eject,        D88_Eject,        DIM_Eject };
 static int (*Seek[4])(int, int, FDCID*)                        = { 0, XDF_Seek,         D88_Seek,         DIM_Seek };
 static int (*ReadID[4])(int, FDCID*)                           = { 0, XDF_ReadID,       D88_ReadID,       DIM_ReadID };
-static int (*WriteID[4])(int, int, unsigned char*, int)        = { 0, XDF_WriteID,      D88_WriteID,      DIM_WriteID };
-static int (*Read[4])(int, FDCID*, unsigned char*)             = { 0, XDF_Read,         D88_Read,         DIM_Read };
-static int (*ReadDiag[4])(int, FDCID*, FDCID*, unsigned char*) = { 0, XDF_ReadDiag,     D88_ReadDiag,     DIM_ReadDiag };
-static int (*Write[4])(int, FDCID*, unsigned char*, int)       = { 0, XDF_Write,        D88_Write,        DIM_Write };
+static int (*WriteID[4])(int, int, uint8_t*, int)        = { 0, XDF_WriteID,      D88_WriteID,      DIM_WriteID };
+static int (*Read[4])(int, FDCID*, uint8_t*)             = { 0, XDF_Read,         D88_Read,         DIM_Read };
+static int (*ReadDiag[4])(int, FDCID*, FDCID*, uint8_t*) = { 0, XDF_ReadDiag,     D88_ReadDiag,     DIM_ReadDiag };
+static int (*Write[4])(int, FDCID*, uint8_t*, int)       = { 0, XDF_Write,        D88_Write,        DIM_Write };
 static int (*GetCurrentID[4])(int, FDCID*)                     = { 0, XDF_GetCurrentID, D88_GetCurrentID, DIM_GetCurrentID };
 
-// -----------------------------------------------------------------------
-//   イメージタイプ判別
-// -----------------------------------------------------------------------
-static void ConvertCapital(unsigned char* buf)
+int FDD_IsReading                                              = 0;
+
+int FDD_StateAction(StateMem *sm, int load, int data_only)
 {
-	for ( ; *buf; buf++) {
-		if ( ((*buf>=0x80)&&(*buf<=0x9f))||(*buf>=0xe0) ) {
+	SFORMAT StateRegs[] = 
+	{
+		SFARRAY32(fdd.SetDelay, 4),
+		SFARRAY32(fdd.Types, 4),
+		SFARRAY32(fdd.ROnly, 4),
+		SFARRAY32(fdd.EMask, 4),
+		SFARRAY32(fdd.Blink, 4),
+
+		SFVAR(fdd.Access),
+
+		SFEND
+	};
+
+	int ret = PX68KSS_StateAction(sm, load, data_only, StateRegs, "X68K_FDD", false);
+
+	return ret;
+}
+
+static void ConvertCapital(char* buf)
+{
+	for ( ; *buf; buf++)
+   {
+		if ( ((*buf>=0x80)&&(*buf<=0x9f))||(*buf>=0xe0) )
 			buf++;
-		} else if ( (*buf>='a')&&(*buf<='z') ) *buf -= 0x20;
+		else if ( (*buf>='a')&&(*buf<='z') )
+         *buf -= 0x20;
 	}
 }
 
@@ -64,25 +85,14 @@ static int GetDiskType(char* file)
 	return ret;
 }
 
-
-
-// -----------------------------------------------------------------------
-//   挿抜割り込み
-// -----------------------------------------------------------------------
-DWORD FASTCALL FDD_Int(BYTE irq)
+static uint32_t FASTCALL FDD_Int(uint8_t irq)
 {
 	IRQH_IRQCallBack(irq);
 	if ( irq==1 )
-		return ((DWORD)IOC_IntVect+1);
-	else
-		return -1;
+		return ((uint32_t)IOC_IntVect+1);
+	return -1;
 }
 
-
-// -----------------------------------------------------------------------
-//   FDせっと
-//     すぐには割り込み上げないです
-// -----------------------------------------------------------------------
 void FDD_SetFD(int drive, char* filename, int readonly)
 {
 	int type = GetDiskType(filename);
@@ -101,10 +111,6 @@ void FDD_SetFD(int drive, char* filename, int readonly)
 	}
 }
 
-
-// -----------------------------------------------------------------------
-//   いじぇくと
-// -----------------------------------------------------------------------
 void FDD_EjectFD(int drive)
 {
 	int type;
@@ -123,9 +129,9 @@ void FDD_EjectFD(int drive)
 }
 
 
-// -----------------------------------------------------------------------
-//   Eject Mask / Blink / AccessDrive
-// -----------------------------------------------------------------------
+/*
+ *   Eject Mask / Blink / AccessDrive
+ */
 void FDD_SetEMask(int drive, int emask)
 {
 	if ( (drive<0)||(drive>3) ) return;
@@ -150,10 +156,6 @@ void FDD_SetBlink(int drive, int blink)
 	StatBar_ParamFDD(drive, (fdd.Types[drive]!=FD_Non)?((fdd.Access==drive)?2:1):0, ((fdd.Types[drive]!=FD_Non)&&(!fdd.EMask[drive]))?1:0, (fdd.Blink[drive])?1:0);
 }
 
-
-// -----------------------------------------------------------------------
-//   初期化
-// -----------------------------------------------------------------------
 void FDD_Init(void)
 {
 	memset(&fdd,0 , sizeof(FDDINFO));
@@ -164,9 +166,6 @@ void FDD_Init(void)
 }
 
 
-// -----------------------------------------------------------------------
-//   終了
-// -----------------------------------------------------------------------
 void FDD_Cleanup(void)
 {
 	D88_Cleanup();
@@ -175,9 +174,6 @@ void FDD_Cleanup(void)
 }
 
 
-// -----------------------------------------------------------------------
-//   りせっと
-// -----------------------------------------------------------------------
 void FDD_Reset(void)
 {
 	int i;
@@ -189,9 +185,6 @@ void FDD_Reset(void)
 }
 
 
-// -----------------------------------------------------------------------
-//   FD入れ替えが起こっていたら割り込み発生
-// -----------------------------------------------------------------------
 void FDD_SetFDInt(void)
 {
 	int i;
@@ -210,98 +203,93 @@ void FDD_SetFDInt(void)
 int FDD_Seek(int drv, int trk, FDCID* id)
 {
 	int type;
-	if ( (drv<0)||(drv>3) ) return FALSE;
+	if ( (drv<0)||(drv>3) ) return 0;
 	type = fdd.Types[drv];
 	if ( Seek[type] )
 		return Seek[type](drv, trk, id);
-	else
-		return FALSE;
+	return 0;
 }
 
 int FDD_ReadID(int drv, FDCID* id)
 {
 	int type;
-	if ( (drv<0)||(drv>3) ) return FALSE;
+	if ( (drv<0)||(drv>3) ) return 0;
 	type = fdd.Types[drv];
 	if ( ReadID[type] )
 		return ReadID[type](drv, id);
-	else
-		return FALSE;
+	return 0;
 }
 
-int FDD_WriteID(int drv, int trk, unsigned char* buf, int num)
+int FDD_WriteID(int drv, int trk, uint8_t* buf, int num)
 {
 	int type;
-	if ( (drv<0)||(drv>3) ) return FALSE;
+	if ( (drv<0)||(drv>3) ) return 0;
 	type = fdd.Types[drv];
 	if ( WriteID[type] )
 		return WriteID[type](drv, trk, buf, num);
-	else
-		return FALSE;
+	return 0;
 }
 
 
-int FDD_Read(int drv, FDCID* id, unsigned char* buf)
+int FDD_Read(int drv, FDCID* id, uint8_t* buf)
 {
 	int type;
-	if ( (drv<0)||(drv>3) ) return FALSE;
+	if ( (drv<0)||(drv>3) ) return 0;
 	type = fdd.Types[drv];
 	if ( Read[type] )
+	{
+		FDD_IsReading = 1;
 		return Read[type](drv, id, buf);
-	else
-		return FALSE;
+	}
+	return 0;
 }
 
 
-int FDD_ReadDiag(int drv, FDCID* id, FDCID* retid, unsigned char* buf)
+int FDD_ReadDiag(int drv, FDCID* id, FDCID* retid, uint8_t* buf)
 {
 	int type;
-	if ( (drv<0)||(drv>3) ) return FALSE;
+	if ( (drv<0)||(drv>3) ) return 0;
 	type = fdd.Types[drv];
 	if ( ReadDiag[type] )
 		return ReadDiag[type](drv, id, retid, buf);
-	else
-		return FALSE;
+	return 0;
 }
 
 
-int FDD_Write(int drv, FDCID* id, unsigned char* buf, int del)
+int FDD_Write(int drv, FDCID* id, uint8_t* buf, int del)
 {
 	int type;
-	if ( (drv<0)||(drv>3) ) return FALSE;
+	if ( (drv<0)||(drv>3) ) return 0;
 	type = fdd.Types[drv];
 	if ( Write[type] )
 		return Write[type](drv, id, buf, del);
-	else
-		return FALSE;
+	return 0;
 }
 
 
 int FDD_GetCurrentID(int drv, FDCID* id)
 {
 	int type;
-	if ( (drv<0)||(drv>3) ) return FALSE;
+	if ( (drv<0)||(drv>3) ) return 0;
 	type = fdd.Types[drv];
 	if ( GetCurrentID[type] )
 		return GetCurrentID[type](drv, id);
-	else
-		return FALSE;
+	return 0;
 }
 
 
 int FDD_IsReady(int drv)
 {
-	if ( (drv<0)||(drv>3) ) return FALSE;
+	if ( (drv<0)||(drv>3) ) return 0;
 	if ( (fdd.Types[drv]!=FD_Non)&&(!fdd.SetDelay[drv]) )
-		return TRUE;
-	else
-		return FALSE;
+		return 1;
+	return 0;
 }
 
 
 int FDD_IsReadOnly(int drv)
 {
-	if ( (drv<0)||(drv>3) ) return FALSE;
+	if ( (drv<0)||(drv>3) ) return 0;
 	return fdd.ROnly[drv];
 }
 

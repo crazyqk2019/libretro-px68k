@@ -1,7 +1,14 @@
-#ifndef winx68k_joy_h
-#define winx68k_joy_h
+#ifndef _WINX68K_JOY_H
+#define _WINX68K_JOY_H
 
+#include <stdint.h>
 #include "common.h"
+
+#define PAD_2BUTTON      0
+#define PAD_CPSF_MD      1
+#define PAD_CPSF_SFC     2
+#define PAD_CYBERSTICK_D 3
+#define PAD_CYBERSTICK_A 4
 
 #define	JOY_UP		0x01
 #define	JOY_DOWN	0x02
@@ -17,29 +24,19 @@
 #define	JOY_TRG8	0x20
 #define	JOY_TRG6	0x40
 
-#ifndef PSP
-#define JOYAXISPLAY 2048
-#endif
-
-#define need_Vpad() (is_menu || Keyboard_IsSwKeyboard() || (!Config.JoyOrMouse && !r_joy))
+/* button combination for start/select button */
+#define JOY_SELECT      0x03 /* up + down */
+#define JOY_START       0x0c /* left + right */
 
 void Joystick_Init(void);
 void Joystick_Cleanup(void);
-BYTE FASTCALL Joystick_Read(BYTE num);
-void FASTCALL Joystick_Write(BYTE num, BYTE data);
+uint8_t FASTCALL Joystick_Read(uint8_t num);
+void FASTCALL Joystick_Write(uint8_t num, uint8_t data);
+void FASTCALL Joystick_Update(int is_menu, int key, int port);
 
-typedef signed int R_Keycode;
-void FASTCALL Joystick_Update(int is_menu, R_Keycode key, int port);
-
-
-BYTE get_joy_downstate(void);
+uint8_t get_joy_downstate(void);
 void reset_joy_downstate(void);
-BYTE get_joy_upstate(void);
-void reset_joy_upstate(void);
 
-extern BYTE JoyKeyState;
-extern BYTE keyb_in, joy_in;
+extern uint8_t JoyKeyState;
 
-extern int  *r_joy;
-
-#endif
+#endif /* WINX68K_JOY_H */

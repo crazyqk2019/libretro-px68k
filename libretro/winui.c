@@ -27,22 +27,21 @@
  *  WINUI.C - UI                                                              *
  * -------------------------------------------------------------------------- */
 
+#include <stdint.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <strings.h>
 
 #include "common.h"
-#include "about.h"
 #include "keyboard.h"
 #include "windraw.h"
 #include "dswin.h"
-#include "fileio.h"
+#include "dosio.h"
 #include "prop.h"
 #include "status.h"
 #include "joystick.h"
 #include "mouse.h"
 #include "winx68k.h"
-#include "version.h"
-#include "juliet.h"
 #include "fdd.h"
 #include "irqh.h"
 #include "../m68000/m68000.h"
@@ -65,42 +64,34 @@
 #include "tvram.h"
 #include "winui.h"
 
-#include <dirent.h>
-#include <sys/stat.h>
-
 #include "fmg_wrap.h"
 
-extern	BYTE		fdctrace;
-extern	BYTE		traceflag;
-extern	WORD		FrameCount;
-extern	DWORD		TimerICount;
-extern	unsigned int	hTimerID;
-	DWORD		timertick=0;
-extern	int		FullScreenFlag;
-	int		UI_MouseFlag = 0;
-	int		UI_MouseX = -1, UI_MouseY = -1;
-extern	short		timertrace;
+#include <file/file_path.h>
 
-	BYTE		MenuClearFlag = 0;
+#ifdef _WIN32
+#define SLASH '\\'
+#else
+#define SLASH '/'
+#endif
 
-	BYTE		Debug_Text=1, Debug_Grp=1, Debug_Sp=1;
+uint8_t	Debug_Text=1, Debug_Grp=1, Debug_Sp=1;
 
-	char		filepath[MAX_PATH] = ".";
-	int		fddblink = 0;
-	int		fddblinkcount = 0;
-	int		hddtrace = 0;
-extern  int		dmatrace;
+char		filepath[MAX_PATH] = ".";
 
-	DWORD		LastClock[4] = {0, 0, 0, 0};
+char     cur_dir_str[MAX_PATH];
+size_t   cur_dir_slen;
 
-char cur_dir_str[MAX_PATH];
-int cur_dir_slen;
+int menu_state = MS_KEY;
+int mkey_y     = 0;
+int mkey_pos   = 0;
 
 struct menu_flist mfl;
 
+extern char base_dir[MAX_PATH];
+
 /***** menu items *****/
 
-#define MENU_NUM 5 //13
+#define MENU_NUM 5
 #define MENU_WINDOW 7
 
 int mval_y[] = {
@@ -111,7 +102,8 @@ int mval_y[] = {
 	0
 };
 
-enum menu_id {
+enum menu_id
+{
 	M_SYS,
 	M_FD0,
 	M_FD1,
@@ -119,7 +111,7 @@ enum menu_id {
 	M_HD1
 };
 
-// Max # of characters is 15.
+/* Max # of characters is 15. */
 char menu_item_key[][15] = {
 	"SYSTEM",
 	"FDD0",
@@ -132,8 +124,8 @@ char menu_item_key[][15] = {
 	""
 };
 
-// Max # of characters is 30.
-// Max # of items including terminater `""' in each line is 15.
+/* Max # of characters is 30. */
+/* Max # of items including terminater `""' in each line is 15. */
 char menu_items[][15][30] = {
 	{"RESET", "NMI RESET", "QUIT", ""},
 	{"dummy", "EJECT", ""},
@@ -142,16 +134,309 @@ char menu_items[][15][30] = {
 	{"dummy", "EJECT", ""}
 };
 
-static void menu_system(int v);
-static void menu_joy_or_mouse(int v);
-static void menu_create_flist(int v);
-static void menu_frame_skip(int v);
-static void menu_sound_rate(int v);
-static void menu_vkey_size(int v);
-static void menu_vbtn_swap(int v);
-static void menu_hwjoy_setting(int v);
-static void menu_nowait(int v);
-static void menu_joykey(int v);
+static void menu_system(int v)
+{
+	switch (v)
+   {
+      case 0 :
+         WinX68k_Reset();
+         break;
+      case 1:
+         IRQH_Int(7, NULL);
+         break;
+   }
+}
+
+static void upper(char *s)
+{
+	while (*s != '\0')
+   {
+      if (*s >= 'a' && *s <= 'z')
+         *s = 'A' + *s - 'a';
+      s++;
+   }
+}
+
+static void switch_mfl(int a, int b)
+{
+   /* exchange 2 values in mfl list */
+   char name_tmp[MAX_PATH];
+   char type_tmp;
+
+   strcpy(name_tmp, mfl.name[a]);
+   type_tmp    = mfl.type[a];
+
+   strcpy(mfl.name[a], mfl.name[b]);
+   mfl.type[a] = mfl.type[b];
+
+   strcpy(mfl.name[b], name_tmp);
+   mfl.type[b] = type_tmp;
+}
+
+#ifdef USE_LIBRETRO_VFS
+static void menu_create_flist(int v)
+{
+	int drv;
+	int i, a;
+	DIRH *dp;
+
+	/* file extension of FD image */
+	char support[] = "D8888DHDMDUP2HDDIMXDFIMG";
+
+	drv = WinUI_get_drv_num(mkey_y);
+
+	if (drv < 0)
+	{
+		return;
+	}
+
+	/* set current directory when FDD is ejected */
+	if (v == 1)
+	{
+		if (drv < 2)
+		{
+			FDD_EjectFD(drv);
+			Config.FDDImage[drv][0] = '\0';
+		}
+		else
+		{
+			Config.HDImage[drv - 2][0] = '\0';
+		}
+		/* retain last directory used upon eject */
+      /* strcpy(mfl.dir[drv], cur_dir_str); */
+		return;
+	}
+
+	if (drv >= 2)
+	{
+		strcpy(support, "HDF");
+	}
+
+	/* This routine gets file lists. */
+	dp = wrap_vfs_opendir(mfl.dir[drv]);
+
+	/* xxx check if dp is null... */
+	if (!dp)
+	{
+		char tmp[PATH_MAX];
+		/* failed to open StartDir, use rom folder as default */
+		/* TODO: check for path more early */
+		sprintf(tmp, "%s%c", base_dir, SLASH);
+		strcpy(mfl.dir[drv], tmp);
+		/* re-open folder */
+		dp = wrap_vfs_opendir(mfl.dir[drv]);
+	}
+
+	/* xxx You can get only MFL_MAX files. */
+	for (i = 0; i < MFL_MAX; i++)
+	{
+		char ent_name[MAX_PATH];
+		const char *n;
+		int st_mode = 0;
+		int st_size = 0;
+
+		if (!(wrap_vfs_readdir(dp)))
+			break;
+
+		n = dp->d_name;
+		strcpy(ent_name, mfl.dir[drv]);
+		strcat(ent_name, n);
+		st_mode = wrap_vfs_stat(ent_name, &st_size);
+
+		if (!(st_mode & STAT_IS_DIRECTORY))
+		{
+			char *p;
+			char ext[4];
+			int len = strlen(n);
+
+			/* Check extension if this is file. */
+			if (len < 4 || *(n + len - 4) != '.')
+			{
+				i--;
+				continue;
+			}
+			strcpy(ext, n + len - 3);
+			upper(ext);
+			p = strstr(support, ext);
+			if (p == NULL || (p - support) % 3 != 0)
+			{
+				i--;
+				continue;
+			}
+		}
+		else
+		{
+			if (!strcmp(n, "."))
+			{
+				i--;
+				continue;
+			}
+
+			/* You can't go up over current directory. */
+			if (!strcmp(n, "..") && !strcmp(mfl.dir[drv], cur_dir_str))
+			{
+				i--;
+				continue;
+			}
+		}
+
+		strcpy(mfl.name[i], n);
+		/* set 1 if this is directory */
+		mfl.type[i] = (st_mode & STAT_IS_DIRECTORY) ? 1 : 0;
+#ifdef DEBUG
+		p6logd("%s 0x%x\n", n, buf.st_mode);
+#endif
+	}
+
+	wrap_vfs_closedir(dp);
+
+	strcpy(mfl.name[i], "");
+	mfl.num = i;
+	mfl.ptr = 0;
+
+	/* Sorting mfl!
+	 * Folder first, than files
+	 * buble sort glory */
+	for (a = 0; a < i - 1; a++)
+	{
+		int b;
+		for (b = a + 1; b < i; b++)
+		{
+			if (mfl.type[a] < mfl.type[b])
+				switch_mfl(a, b);
+			if ((mfl.type[a] == mfl.type[b]) && (strcasecmp(mfl.name[a], mfl.name[b]) > 0))
+				switch_mfl(a, b);
+		}
+	}
+}
+
+#else /* !USE_LIBRETRO_VFS */
+
+#include <dirent.h>
+#include <sys/stat.h>
+static void menu_create_flist(int v)
+{
+   DIR *dp;
+   int i, len;
+   int a, b;
+   struct dirent *dent;
+   struct stat buf;
+   char *n, ext[4], *p;
+   char ent_name[MAX_PATH];
+   /* file extension of FD image */
+   char support[] = "D8888DHDMDUP2HDDIMXDFIMG";
+   int drv        = WinUI_get_drv_num(mkey_y);
+
+   if (drv < 0)
+      return;
+
+   /* set current directory when FDD is ejected */
+   if (v == 1)
+   {
+      if (drv < 2)
+      {
+         FDD_EjectFD(drv);
+         Config.FDDImage[drv][0] = '\0';
+      }
+      else
+         Config.HDImage[drv - 2][0] = '\0';
+      /* retain last directory used upon eject */
+      /* strcpy(mfl.dir[drv], cur_dir_str); */
+      return;
+   }
+
+   if (drv >= 2)
+      strcpy(support, "HDF");
+
+   /* This routine gets file lists. */
+   dp = opendir(mfl.dir[drv]);
+
+   /* xxx check if dp is null... */
+   if (!dp)
+   {
+      char tmp[PATH_MAX];
+      /* failed to open StartDir, use rom folder as default */
+      /* TODO: check for path more early */
+      snprintf(tmp, sizeof(tmp), "%s%c", base_dir, SLASH);
+      strcpy(mfl.dir[drv], tmp);
+      /* re-open folder */
+      dp = opendir(mfl.dir[drv]);
+   }
+
+   /* xxx You can get only MFL_MAX files. */
+   for (i = 0 ; i < MFL_MAX; i++)
+   {
+      dent = readdir(dp);
+      if (!dent)
+         break;
+      n = dent->d_name;
+      strcpy(ent_name, mfl.dir[drv]);
+      strcat(ent_name, n);
+      stat(ent_name, &buf);
+
+      if (!S_ISDIR(buf.st_mode))
+      {
+         /* Check extension if this is file. */
+         len = strlen(n);
+         if (len < 4 || *(n + len - 4) != '.')
+         {
+            i--;
+            continue;
+         }
+         strcpy(ext, n + len - 3);
+         upper(ext);
+         p = strstr(support, ext);
+         if (!p || (p - support) % 3 != 0)
+         {
+            i--;
+            continue;
+         }
+      }
+      else
+      {
+         if (!strcmp(n, "."))
+         {
+            i--;
+            continue;
+         }
+
+         /* You can't go up over current directory. */
+         if (     !strcmp(n, "..")
+               && !strcmp(mfl.dir[drv], cur_dir_str))
+         {
+            i--;
+            continue;
+         }
+      }
+
+      strcpy(mfl.name[i], n);
+      /* set 1 if this is directory */
+      mfl.type[i] = S_ISDIR(buf.st_mode)? 1 : 0;
+   }
+
+   closedir(dp);
+
+   strcpy(mfl.name[i], "");
+   mfl.num = i;
+   mfl.ptr = 0;
+
+   /* Sorting mfl!
+    * Folder first, than files
+    * buble sort glory */
+   for (a=0; a<i-1; a++)
+   {
+      for (b=a+1; b<i; b++)
+      {
+         if (mfl.type[a]<mfl.type[b])
+            switch_mfl(a, b);
+         if (     (mfl.type[a] == mfl.type[b]) 
+               && (strcasecmp(mfl.name[a], mfl.name[b]) > 0))
+            switch_mfl(a, b);
+      }
+   }
+}
+
+#endif
 
 struct _menu_func {
 	void (*func)(int v);
@@ -170,742 +455,402 @@ int WinUI_get_drv_num(int key)
 {
 	char *s = menu_item_key[key];
 
-	if (!strncmp("FDD", s, 3)) {
+	if (!strncmp("FDD", s, 3))
 		return strcmp("FDD0", s)?
 			(strcmp("FDD1", s)? -1 : 1) : 0;
-	} else {
-		return strcmp("HDD0", s)?
-			(strcmp("HDD1", s)? -1: 3) : 2;
-	}
+	return strcmp("HDD0", s)?
+		(strcmp("HDD1", s)? -1: 3) : 2;
 }
 
-static void menu_hwjoy_print(int v)
-{
-	/*if (v <= 1) {
-		sprintf(menu_items[M_HJS][v], "Axis%d(%s): %d",
-			v,
-			(v == 0)? "Left/Right" : "Up/Down",
-			Config.HwJoyAxis[v]);
-	} else if (v == 2) {
-		sprintf(menu_items[M_HJS][v], "Hat: %d", Config.HwJoyHat);
-	} else {
-		sprintf(menu_items[M_HJS][v], "Button%d: %d",
-			v - 3,
-			Config.HwJoyBtn[v - 3]);
-	}*/
-}
-
-/******************************************************************************
- * init
- ******************************************************************************/
-void
-WinUI_Init(void)
-{
-	int i;
-
-	for (i = 0; i < 11; i++) {
-		menu_hwjoy_print(i);
-	}
-
-#if defined(ANDROID)
-#define CUR_DIR_STR winx68k_dir
-#elif TARGET_OS_IPHONE && TARGET_IPHONE_SIMULATOR == 0
-#define CUR_DIR_STR "/var/mobile/px68k/"
-#else
-
-#ifdef __LIBRETRO__
-
+/* TODO/FIXME - we need a way of iterating over all drives for Windows */
 #ifdef _WIN32
 #define CUR_DIR_STR "c:\\"
 #else
 #define CUR_DIR_STR "/"
 #endif
-#else
-#define CUR_DIR_STR "./"
-#endif
-#endif
-if(filepath[0] != 0)strcpy(cur_dir_str, filepath);
-else	strcpy(cur_dir_str, CUR_DIR_STR);
-#ifdef ANDROID
-	strcat(cur_dir_str, "/");
-#endif
-	cur_dir_slen = strlen(cur_dir_str);
-	p6logd("cur_dir_str %s %d\n", cur_dir_str, cur_dir_slen);
 
-	for (i = 0; i < 4; i++) {
-		strcpy(mfl.dir[i], cur_dir_str);
-	}
-}
-
-#if 0
-/*
- * item function
- */
-static void
-reset(gpointer data, guint action, GtkWidget *w)
+/******************************************************************************
+ * init
+ ******************************************************************************/
+void plusyen(char *s, size_t len);
+void WinUI_Init(void)
 {
-	WinX68k_Reset();
-	if (Config.MIDI_SW && Config.MIDI_Reset)
-		MIDI_Reset();
+	int i;
+
+   if(filepath[0] != 0)
+      strcpy(cur_dir_str, filepath);
+   else
+      strcpy(cur_dir_str, CUR_DIR_STR);
+
+   plusyen(cur_dir_str, sizeof(cur_dir_str));
+   cur_dir_slen = strlen(cur_dir_str);
+
+   for (i = 0; i < 4; i++)
+	   strcpy(mfl.dir[i], cur_dir_str);
 }
 
-static void
-stretch(gpointer data, guint action, GtkWidget *w)
-{
-	UNUSED(data);
-	UNUSED(w);
-
-	if (Config.WinStrech != (int)action)
-		Config.WinStrech = action;
-}
-
-static void
-xvimode(gpointer data, guint action, GtkWidget *w)
-{
-	UNUSED(data);
-	UNUSED(w);
-
-	if (Config.XVIMode != (int)action)
-		Config.XVIMode = action;
-}
-
-static void
-videoreg_save(gpointer data, guint action, GtkWidget *w)
-{
-	char buf[256];
-
-	UNUSED(data);
-	UNUSED(action);
-	UNUSED(w);
-
-	DSound_Stop();
-	g_snprintf(buf, sizeof(buf),
-	             "VCReg 0:$%02X%02X 1:$%02x%02X 2:$%02X%02X  "
-	             "CRTC00/02/05/06=%02X/%02X/%02X/%02X%02X  "
-		     "BGHT/HD/VD=%02X/%02X/%02X   $%02X/$%02X",
-	    VCReg0[0], VCReg0[1], VCReg1[0], VCReg1[1], VCReg2[0], VCReg2[1],
-	    CRTC_Regs[0x01], CRTC_Regs[0x05], CRTC_Regs[0x0b], CRTC_Regs[0x0c],
-	      CRTC_Regs[0x0d],
-	    BG_Regs[0x0b], BG_Regs[0x0d], BG_Regs[0x0f],
-	    CRTC_Regs[0x29], BG_Regs[0x11]);
-	Error(buf);
-	DSound_Play();
-}
-
-#endif
-
-float VKey_scale[] = {3.0, 2.5, 2.0, 1.5, 1.25, 1.0};
-
-float WinUI_get_vkscale(void)
-{
-	int n = Config.VkeyScale;
-
-	// failsafe against invalid values
-	if (n < 0 || n >= sizeof(VKey_scale)/sizeof(float)) {
-		return 1.0;
-	}
-	return VKey_scale[n];
-}
-
-int menu_state = ms_key;
-int mkey_y = 0;
-int mkey_pos = 0;
-
-static void menu_system(int v)
-{
-	switch (v) {
-	case 0 :
-		WinX68k_Reset();
-		break;
-	case 1:
-		IRQH_Int(7, NULL);
-		break;
-	}
-}
-
-static void menu_joy_or_mouse(int v)
-{
-	Config.JoyOrMouse = v;
-	Mouse_StartCapture(v == 1);
-}
-
-
-static void upper(char *s)
-{
-	while (*s != '\0') {
-		if (*s >= 'a' && *s <= 'z') {
-			*s = 'A' + *s - 'a';
-		}
-		s++;
-	}
-}
-
-static void switch_mfl(int a, int b)
-{
-	// exchange 2 values in mfl list
-	char name_tmp[MAX_PATH];
-	char type_tmp;
-
-	strcpy(name_tmp, mfl.name[a]);
-	type_tmp = mfl.type[a];
-
-	strcpy(mfl.name[a], mfl.name[b]);
-	mfl.type[a] = mfl.type[b];
-
-	strcpy(mfl.name[b], name_tmp);
-	mfl.type[b] = type_tmp;
-}
-
-#ifdef __LIBRETRO__
-extern char slash;
-extern char base_dir[MAX_PATH];
-#endif
-
-static void menu_create_flist(int v)
-{
-	int drv;
-	//file extension of FD image
-	char support[] = "D8888DHDMDUP2HDDIMXDFIMG";
-
-	drv = WinUI_get_drv_num(mkey_y);
-
-	if (drv < 0) {
-		return;
-	}
-
-	// set current directory when FDD is ejected
-	if (v == 1) {
-		if (drv < 2) {
-			FDD_EjectFD(drv);
-			Config.FDDImage[drv][0] = '\0';
-		} else {
-			Config.HDImage[drv - 2][0] = '\0';
-		}
-		strcpy(mfl.dir[drv], cur_dir_str);
-		return;
-	}
-
-	if (drv >= 2) {
-		strcpy(support, "HDF");
-	}
-
-	// This routine gets file lists.
-	DIR *dp;
-	struct dirent *dent;
-	struct stat buf;
-	int i, len;
-	char *n, ext[4], *p;
-	char ent_name[MAX_PATH];
-
-	dp = opendir(mfl.dir[drv]);
-
-	// xxx check if dp is null...
-	if (!dp) {
-		char tmp[PATH_MAX];
-		/* failed to open StartDir, use rom folder as default */
-		/* TODO: check for path more early */
-		p6logd("Error opening StartDir, using rom path instead...\n");
-		snprintf(tmp, sizeof(tmp), "%s%c", base_dir, slash);
-		strcpy(mfl.dir[drv], tmp);
-		/* re-open folder */
-		dp = opendir(mfl.dir[drv]);
-	}
-
-	p6logd("*** drv:%d ***** %s \n", drv, mfl.dir[drv]);
-
-	// xxx You can get only MFL_MAX files.
-	for (i = 0 ; i < MFL_MAX; i++) {
-		dent = readdir(dp);
-		if (dent == NULL) {
-			break;
-		}
-		n = dent->d_name;
-		strcpy(ent_name, mfl.dir[drv]);
-		strcat(ent_name, n);
-		stat(ent_name, &buf);
-
-		if (!S_ISDIR(buf.st_mode)) {
-			// Check extension if this is file.
-			len = strlen(n);
-			if (len < 4 || *(n + len - 4) != '.') {
-				i--;
-				continue;
-			}
-			strcpy(ext, n + len - 3);
-			upper(ext);
-			p = strstr(support, ext);
-			if (p == NULL || (p - support) % 3 != 0) {
-				i--;
-				continue;
-			}
-		} else {
-			if (!strcmp(n, ".")) {
-				i--;
-				continue;
-			}
-
-			// You can't go up over current directory.
-			if (!strcmp(n, "..") &&
-			    !strcmp(mfl.dir[drv], cur_dir_str)) {
-				i--;
-				continue;
-			}
-		}
-
-		strcpy(mfl.name[i], n);
-		// set 1 if this is directory
-		mfl.type[i] = S_ISDIR(buf.st_mode)? 1 : 0;
-#ifdef DEBUG
-		p6logd("%s 0x%x\n", n, buf.st_mode);
-#endif
-	}
-
-	closedir(dp);
-
-	strcpy(mfl.name[i], "");
-	mfl.num = i;
-	mfl.ptr = 0;
-
-	// Sorting mfl!
-	// Folder first, than files
-	// buble sort glory
-	for (int a=0; a<i-1; a++) {
-		for (int b=a+1; b<i; b++) {
-			if (mfl.type[a]<mfl.type[b])
-				switch_mfl(a, b);
-			if ((mfl.type[a]==mfl.type[b]) && (strcasecmp(mfl.name[a], mfl.name[b])>0))
-				switch_mfl(a, b);
-		}
-	}
-}
-
-static void menu_frame_skip(int v)
-{
-	if (v == 0) {
-		Config.FrameRate = 7;
-	} else if (v == 7) {
-		Config.FrameRate = 8;
-	} else if (v == 8) {
-		Config.FrameRate = 16;
-	} else if (v == 9) {
-		Config.FrameRate = 32;
-	} else if (v == 10) {
-		Config.FrameRate = 60;
-	} else {
-		Config.FrameRate = v;
-	}
-}
-
-static void menu_sound_rate(int v)
-{
-	if (v == 0) {
-		Config.SampleRate = 0;
-	} else if (v == 1) {
-		Config.SampleRate = 11025;
-	} else if (v == 2) {
-		Config.SampleRate = 22050;
-	} else if (v == 3) {
-		Config.SampleRate = 44100;
-	} else if (v == 4) {
-		Config.SampleRate = 48000;
-	}
-}
-
-static void menu_vkey_size(int v)
-{
-	Config.VkeyScale = v;
-}
-
-static void menu_vbtn_swap(int v)
-{
-	Config.VbtnSwap = v;
-}
-
-static void menu_hwjoy_setting(int v)
-{
-	menu_state = ms_hwjoy_set;
-}
-
-static void menu_nowait(int v)
-{
-	Config.NoWaitMode = v;
-}
-
-static void menu_joykey(int v)
-{
-	Config.JoyKey = v;
-}
-
-// ex. ./hoge/.. -> ./
-// ( ./ ---down hoge dir--> ./hoge ---up hoge dir--> ./hoge/.. )
+/* ex. ./hoge/.. -> ./
+ * ( ./ ---down hoge dir--> ./hoge ---up hoge dir--> ./hoge/.. ) */
 static void shortcut_dir(int drv)
 {
-	int i, len, found = 0;
-	char *p;
-
-	// len is larger than 2
-	len = strlen(mfl.dir[drv]);
-	p = mfl.dir[drv] + len - 2;
-	for (i = len - 2; i >= 0; i--) {
-		if (*p == slash/*'/'*/) {
-			found = 1;
-			break;
-		}
-		p--;
-	}
+   int i, found = 0;
+   /* len is larger than 2 */
+   size_t len = strlen(mfl.dir[drv]);
+   char *p    = mfl.dir[drv] + len - 2;
+   for (i = len - 2; i >= 0; i--)
+   {
+      if (*p == SLASH/*'/'*/)
+      {
+         found = 1;
+         break;
+      }
+      p--;
+   }
 #ifdef _WIN32
-	if (found && strcmp(p, "\\..\\")) {
+   if (found && strcmp(p, "\\..\\"))
 #else
-	if (found && strcmp(p, "/../")) {
+      if (found && strcmp(p, "/../"))
 #endif
-		*(p + 1) = '\0';
-	} else {
+         *(p + 1) = '\0';
+      else
 #ifdef _WIN32
-		strcat(mfl.dir[drv], "..\\");
+         strcat(mfl.dir[drv], "..\\");
 #else
-		strcat(mfl.dir[drv], "../");
+   strcat(mfl.dir[drv], "../");
 #endif
-	}
 }
-
-int speedup_joy[0xff] = {0};
 
 int WinUI_Menu(int first)
 {
-	int i, n;
-	int cursor0;
-	BYTE joy;
-	int menu_redraw = 0;
-	int pad_changed = 0;
-	int mfile_redraw = 0;
+   int i, n, ii;
+   int cursor0;
+   uint8_t joy;
+   int menu_redraw  = 0;
+   int pad_changed  = 0;
+   int mfile_redraw = 0;
 
-	if (first) {
-		menu_state = ms_key;
-		mkey_y = 0;
-		mkey_pos = 0;
-		menu_redraw = 1;
-		first = 0;
-		//  The screen is not rewritten without any key actions,
-		// so draw screen first.
-		WinDraw_ClearMenuBuffer();
-		WinDraw_DrawMenu(menu_state, mkey_pos, mkey_y, mval_y);
-	}
+   if (first)
+   {
+      menu_state    = MS_KEY;
+      mkey_y        = 0;
+      mkey_pos      = 0;
+      menu_redraw   = 1;
+      first         = 0;
+      /*  The screen is not rewritten without any key actions,
+       * so draw screen first. */
+      WinDraw_ClearMenuBuffer();
+      WinDraw_DrawMenu(menu_state, mkey_pos, mkey_y, mval_y);
+   }
 
-	cursor0 = mkey_y;
-	joy = get_joy_downstate();
-	reset_joy_downstate();
+   cursor0 = mkey_y;
+   joy     = get_joy_downstate();
+   reset_joy_downstate();
 
-	if (speedup_joy[JOY_RIGHT])
-		joy &= ~JOY_RIGHT;
-	if (speedup_joy[JOY_LEFT])
-		joy &= ~JOY_LEFT;
-	if (speedup_joy[JOY_UP])
-		joy &= ~JOY_UP;
-	if (speedup_joy[JOY_DOWN])
-		joy &= ~JOY_DOWN;
+   if (!(joy & JOY_UP))
+   {
+      switch (menu_state)
+      {
+         case MS_KEY:
+            if (mkey_y > 0)
+               mkey_y--;
+            if (mkey_pos > mkey_y)
+               mkey_pos--;
+            break;
+         case MS_VALUE:
+            if (mval_y[mkey_y] > 0)
+            {
+               mval_y[mkey_y]--;
 
-	if (!(joy & JOY_UP)) {
-		switch (menu_state) {
-		case ms_key:
-			if (mkey_y > 0) {
-				mkey_y--;
-			}
-			if (mkey_pos > mkey_y) {
-				mkey_pos--;
-			}
-			break;
-		case ms_value:
-			if (mval_y[mkey_y] > 0) {
-				mval_y[mkey_y]--;
+               /* do something immediately */
+               if (menu_func[mkey_y].imm)
+                  menu_func[mkey_y].func(mval_y[mkey_y]);
 
-				// do something immediately
-				if (menu_func[mkey_y].imm) {
-					menu_func[mkey_y].func(mval_y[mkey_y]);
-				}
+               menu_redraw = 1;
+            }
+            break;
+         case MS_FILE:
+            if (mfl.y == 0)
+            {
+               if (mfl.ptr > 0)
+                  mfl.ptr--;
+            }
+            else
+               mfl.y--;
+            mfile_redraw = 1;
+            break;
+      }
+   }
 
-				menu_redraw = 1;
-			}
-			break;
-		case ms_file:
-			if (mfl.y == 0) {
-				if (mfl.ptr > 0) {
-					mfl.ptr--;
-				}
-			} else {
-				mfl.y--;
-			}
-			mfile_redraw = 1;
-			break;
-		}
-	}
+   if (!(joy & JOY_DOWN))
+   {
+      switch (menu_state)
+      {
+         case MS_KEY:
+            if (mkey_y < MENU_NUM - 1)
+               mkey_y++;
+            if (mkey_y > mkey_pos + MENU_WINDOW - 1)
+               mkey_pos++;
+            break;
+         case MS_VALUE:
+            if (menu_items[mkey_y][mval_y[mkey_y] + 1][0] != '\0')
+            {
+               mval_y[mkey_y]++;
 
-	if (!(joy & JOY_DOWN)) {
-		switch (menu_state) {
-		case ms_key:
-			if (mkey_y < MENU_NUM - 1) {
-				mkey_y++;
-			}
-			if (mkey_y > mkey_pos + MENU_WINDOW - 1) {
-				mkey_pos++;
-			}
-			break;
-		case ms_value:
-			if (menu_items[mkey_y][mval_y[mkey_y] + 1][0] != '\0') {
-				mval_y[mkey_y]++;
+               if (menu_func[mkey_y].imm)
+                  menu_func[mkey_y].func(mval_y[mkey_y]);
 
-				if (menu_func[mkey_y].imm) {
-					menu_func[mkey_y].func(mval_y[mkey_y]);
-				}
+               menu_redraw = 1;
+            }
+            break;
+         case MS_FILE:
+            if (mfl.y == 13)
+            {
+               if (mfl.ptr + 14 < mfl.num
+                     && mfl.ptr < MFL_MAX - 13)
+                  mfl.ptr++;
+            }
+            else if (mfl.y + 1 < mfl.num)
+               mfl.y++;
+            mfile_redraw = 1;
+            break;
+      }
+   }
 
-				menu_redraw = 1;
-			}
-			break;
-		case ms_file:
-			if (mfl.y == 13) {
-				if (mfl.ptr + 14 < mfl.num
-				    && mfl.ptr < MFL_MAX - 13) {
-					mfl.ptr++;
-				}
-			} else if (mfl.y + 1 < mfl.num) {
-				mfl.y++;
-#ifdef DEBUG
-				p6logd("mfl.y %d\n", mfl.y);
-#endif
-			}
-			mfile_redraw = 1;
-			break;
-		}
-	}
+   if (!(joy & JOY_LEFT))
+   {
+      switch (menu_state)
+      {
+         case MS_KEY:
+            break;
+         case MS_VALUE:
+            if (mval_y[mkey_y] > 0)
+            {
+               mval_y[mkey_y]-=10;
+               if (mval_y[mkey_y]<0)
+                  mval_y[mkey_y] = 0;
 
-	if (!(joy & JOY_LEFT)) {
-		switch (menu_state) {
-		case ms_key:
-			break;
-		case ms_value:
-			if (mval_y[mkey_y] > 0) {
-				mval_y[mkey_y]-=10;
-				if (mval_y[mkey_y]<0)
-					mval_y[mkey_y] = 0;
+               /* do something immediately */
+               if (menu_func[mkey_y].imm)
+                  menu_func[mkey_y].func(mval_y[mkey_y]);
 
-				// do something immediately
-				if (menu_func[mkey_y].imm) {
-					menu_func[mkey_y].func(mval_y[mkey_y]);
-				}
+               menu_redraw = 1;
+            }
+            break;
+         case MS_FILE:
+            if (mfl.y == 0)
+            {
+               if (mfl.ptr > 0)
+               {
+                  mfl.ptr-=10;
+                  if (mfl.ptr < 0 )
+                     mfl.ptr = 0;
+               }
+            }
+            else
+            {
+               mfl.y-=10;
+               if (mfl.y<0)
+               {
+                  if (mfl.ptr > 0)
+                     mfl.ptr += mfl.y;
+                  if (mfl.ptr < 0)
+                     mfl.ptr = 0;
+                  mfl.y = 0;
+               }
+            }
+            mfile_redraw = 1;
+            break;
+      }
+   }
 
-				menu_redraw = 1;
-			}
-			break;
-		case ms_file:
-			if (mfl.y == 0) {
-				if (mfl.ptr > 0) {
-					mfl.ptr-=10;
-					if (mfl.ptr < 0 )
-						mfl.ptr = 0;
-				}
-			} else {
-				mfl.y-=10;
-				if (mfl.y<0) {
-					if (mfl.ptr > 0)
-						mfl.ptr += mfl.y;
-					if (mfl.ptr < 0)
-						mfl.ptr = 0;
-					mfl.y = 0;
-				}
-			}
-			mfile_redraw = 1;
-			break;
-		}
-	}
+   if (!(joy & JOY_RIGHT))
+   {
+      switch (menu_state)
+      {
+         case MS_KEY:
+            break;
+         case MS_VALUE:
+            for (ii = 0; ii<10; ii++)
+            {
+               if (menu_items[mkey_y][mval_y[mkey_y] + 1][0] != '\0')
+               {
+                  mval_y[mkey_y]++;
 
-	if (!(joy & JOY_RIGHT)) {
-		switch (menu_state) {
-		case ms_key:
-			break;
-		case ms_value:
-			for (int ii = 0; ii<10; ii++) {
-				if (menu_items[mkey_y][mval_y[mkey_y] + 1][0] != '\0') {
-					mval_y[mkey_y]++;
+                  if (menu_func[mkey_y].imm)
+                     menu_func[mkey_y].func(mval_y[mkey_y]);
 
-					if (menu_func[mkey_y].imm) {
-						menu_func[mkey_y].func(mval_y[mkey_y]);
-					}
+                  menu_redraw = 1;
+               }
+            }
+            break;
+         case MS_FILE:
+            for (ii=0; ii<10; ii++)
+            {
+               if (mfl.y == 13)
+               {
+                  if (mfl.ptr + 14 < mfl.num
+                        && mfl.ptr < MFL_MAX - 13)
+                     mfl.ptr++;
+               } else if (mfl.y + 1 < mfl.num)
+                  mfl.y++;
+               mfile_redraw = 1;
+            }
+            break;
+      }
+   }
 
-					menu_redraw = 1;
-				}
-			}
-			break;
-		case ms_file:
-			for (int ii=0; ii<10; ii++) {
-				if (mfl.y == 13) {
-					if (mfl.ptr + 14 < mfl.num
-					    && mfl.ptr < MFL_MAX - 13) {
-						mfl.ptr++;
-					}
-				} else if (mfl.y + 1 < mfl.num) {
-					mfl.y++;
-#ifdef DEBUG
-					printf("mfl.y %d\n", mfl.y);
-#endif
-				}
-				mfile_redraw = 1;
-			}
-			break;
-		}
-	}
+   if (!(joy & JOY_TRG1))
+   {
+      int drv, y;
+      switch (menu_state)
+      {
+         case MS_KEY:
+            menu_state  = MS_VALUE;
+            menu_redraw = 1;
+            break;
+         case MS_VALUE:
+            menu_func[mkey_y].func(mval_y[mkey_y]);
 
-	if (!(joy & JOY_TRG1)) {
-		int drv, y;
-		switch (menu_state) {
-		case ms_key:
-			menu_state = ms_value;
-			menu_redraw = 1;
-			break;
-		case ms_value:
-			menu_func[mkey_y].func(mval_y[mkey_y]);
+            if (menu_state == MS_HWJOY_SET)
+            {
+               menu_redraw = 1;
+               break;
+            }
 
-			if (menu_state == ms_hwjoy_set) {
-				menu_redraw = 1;
-				break;
-			}
+            /* get back key_mode if value is set.
+             * go file_mode if value is filename. */
+            menu_state = MS_KEY;
+            menu_redraw = 1;
 
-			// get back key_mode if value is set.
-			// go file_mode if value is filename.
-			menu_state = ms_key;
-			menu_redraw = 1;
-
-			drv = WinUI_get_drv_num(mkey_y);
-			p6logd("**** drv:%d *****\n", drv);
-			if (drv >= 0) {
-				if (mval_y[mkey_y] == 0) {
-					// go file_mode
-					p6logd("hoge:%d\n", mval_y[mkey_y]);
-					menu_state = ms_file;
-					menu_redraw = 0; //reset
-					mfile_redraw = 1;
-				} else { // mval_y[mkey_y] == 1
-					// FDD_EjectFD() is done, so set 0.
-					mval_y[mkey_y] = 0;
-					// 11-19-17 added for libretro logging
-					switch (drv)
-					{
-						case 0: p6logd("fdd0 ejected...\n", drv); break;
-						case 1: p6logd("fdd1 ejected...\n", drv); break;
-						case 2: p6logd("hdd0 ejected...\n", drv); break;
-						case 3: p6logd("hdd1 ejected...\n", drv); break;
-					}
-				}
-			} else if (!strcmp("SYSTEM", menu_item_key[mkey_y])) {
-				if (mval_y[mkey_y] == 2) {
-					return WUM_EMU_QUIT;
-				}
-				return WUM_MENU_END;
-			}
-			break;
-		case ms_file:
-			drv = WinUI_get_drv_num(mkey_y);
-			p6logd("***** drv:%d *****\n", drv);
-			if (drv < 0) {
-				break;
-			}
-			y = mfl.ptr + mfl.y;
-			// file loaded
-			// p6logd("file selected: %s\n", mfl.name[y]);
-			if (mfl.type[y]) {
-				// directory operation
-				if (!strcmp(mfl.name[y], "..")) {
-					shortcut_dir(drv);
-					mfl.stack[0][mfl.stackptr] = mfl.stack[1][mfl.stackptr] = 0;
-					mfl.stackptr = (mfl.stackptr - 1) % 256;
-					mfl.ptr = mfl.stack[0][mfl.stackptr];
-					mfl.y = mfl.stack[1][mfl.stackptr];
-				} else {
-					strcat(mfl.dir[drv], mfl.name[y]);
+            drv = WinUI_get_drv_num(mkey_y);
+            if (drv >= 0)
+            {
+               if (mval_y[mkey_y] == 0)
+               {
+                  /* go file_mode */
+                  menu_state     = MS_FILE;
+                  menu_redraw    = 0; /* reset */
+                  mfile_redraw   = 1;
+               }
+               else 
+                  mval_y[mkey_y] = 0;
+            }
+            else if (!strcmp("SYSTEM", menu_item_key[mkey_y]))
+            {
+               if (mval_y[mkey_y] == 2)
+                  return WUM_EMU_QUIT;
+               return WUM_MENU_END;
+            }
+            break;
+         case MS_FILE:
+            if ((drv = WinUI_get_drv_num(mkey_y)) < 0)
+               break;
+            y = mfl.ptr + mfl.y;
+            /* file loaded */
+            if (mfl.type[y])
+            {
+               /* directory operation */
+               if (!strcmp(mfl.name[y], ".."))
+               {
+                  shortcut_dir(drv);
+                  mfl.stack[0][mfl.stackptr] = mfl.stack[1][mfl.stackptr] = 0;
+                  mfl.stackptr               = (mfl.stackptr - 1) % 256;
+                  mfl.ptr                    = mfl.stack[0][mfl.stackptr];
+                  mfl.y                      = mfl.stack[1][mfl.stackptr];
+               }
+               else
+               {
+                  strncat(mfl.dir[drv], mfl.name[y], sizeof(mfl.dir[drv]) - 1);
 #ifdef _WIN32
-					strcat(mfl.dir[drv], "\\");
+                  strcat(mfl.dir[drv], "\\");
 #else
-					strcat(mfl.dir[drv], "/");
+                  strcat(mfl.dir[drv], "/");
 #endif
-					mfl.stack[0][mfl.stackptr] = mfl.ptr;
-					mfl.stack[1][mfl.stackptr] = mfl.y;
-					mfl.stackptr = (mfl.stackptr + 1) % 256;
-					mfl.ptr = 0;
-					mfl.y = 0;
-				}
-				p6logd("directory selected: %s\n", mfl.name[y]);
-				menu_func[mkey_y].func(0);
-				mfile_redraw = 1;
-			} else {
-				// file operation
-				p6logd("file selected: %s\n", mfl.name[y]);
-				if (strlen(mfl.name[y]) != 0) {
-					char tmpstr[MAX_PATH];
-					strcpy(tmpstr, mfl.dir[drv]);
-					strcat(tmpstr, mfl.name[y]);
-					if (drv < 2) {
-						FDD_SetFD(drv, tmpstr, 0);
-						strcpy(Config.FDDImage[drv], tmpstr);
-					} else {
-						strcpy(Config.HDImage[drv - 2], tmpstr);
-					}
-				}
-				menu_state = ms_key;
-				menu_redraw = 1;
-			}
-			mfl.ptr = mfl.stack[0][mfl.stackptr];
-			mfl.y = mfl.stack[1][mfl.stackptr];
-			break;
-		case ms_hwjoy_set:
-			// Go back keymode
-			// if TRG1 of v-pad or hw keyboard was pushed.
-			if (!pad_changed) {
-				menu_state = ms_key;
-				menu_redraw = 1;
-			}
-			break;
-		}
-	}
+                  mfl.stack[0][mfl.stackptr] = mfl.ptr;
+                  mfl.stack[1][mfl.stackptr] = mfl.y;
+                  mfl.stackptr = (mfl.stackptr + 1) % 256;
+                  mfl.ptr = 0;
+                  mfl.y = 0;
+               }
+               menu_func[mkey_y].func(0);
+               mfile_redraw = 1;
+            } else {
+               /* file operation */
+               if (strlen(mfl.name[y]) != 0)
+               {
+                  char tmpstr[MAX_PATH];
+                  strcpy(tmpstr, mfl.dir[drv]);
+                  strcat(tmpstr, mfl.name[y]);
+                  if (drv < 2)
+                  {
+                     FDD_SetFD(drv, tmpstr, 0);
+                     strcpy(Config.FDDImage[drv], tmpstr);
+                  }
+                  else
+                     strcpy(Config.HDImage[drv - 2], tmpstr);
+               }
+               menu_state  = MS_KEY;
+               menu_redraw = 1;
+            }
+            mfl.ptr = mfl.stack[0][mfl.stackptr];
+            mfl.y = mfl.stack[1][mfl.stackptr];
+            break;
+         case MS_HWJOY_SET:
+            /* Go back keymode
+             * if TRG1 of v-pad or hw keyboard was pushed. */
+            if (!pad_changed)
+            {
+               menu_state  = MS_KEY;
+               menu_redraw = 1;
+            }
+            break;
+      }
+   }
 
-	if (!(joy & JOY_TRG2)) {
-		switch (menu_state) {
-		case ms_file:
-			menu_state = ms_value;
-			// reset position of file cursor
-			mfl.y = 0;
-			mfl.ptr = 0;
-			menu_redraw = 1;
-			break;
-		case ms_value:
-			menu_state = ms_key;
-			menu_redraw = 1;
-			break;
-		case ms_hwjoy_set:
-			// Go back keymode
-			// if TRG2 of v-pad or hw keyboard was pushed.
-			if (!pad_changed) {
-				menu_state = ms_key;
-				menu_redraw = 1;
-			}
-			break;
-		}
-	}
+   if (!(joy & JOY_TRG2))
+   {
+      switch (menu_state)
+      {
+         case MS_FILE:
+            menu_state  = MS_VALUE;
+            /* reset position of file cursor */
+            mfl.y       = 0;
+            mfl.ptr     = 0;
+            menu_redraw = 1;
+            break;
+         case MS_VALUE:
+            menu_state  = MS_KEY;
+            menu_redraw = 1;
+            break;
+         case MS_HWJOY_SET:
+            /* Go back keymode
+             * if TRG2 of v-pad or hw keyboard was pushed. */
+            if (!pad_changed)
+            {
+               menu_state  = MS_KEY;
+               menu_redraw = 1;
+            }
+            break;
+      }
+   }
 
-	if (pad_changed) {
-		menu_redraw = 1;
-	}
+   if (pad_changed)
+      menu_redraw = 1;
 
-	if (cursor0 != mkey_y) {
-		menu_redraw = 1;
-	}
+   if (cursor0 != mkey_y)
+      menu_redraw = 1;
 
-	if (mfile_redraw) {
-		WinDraw_DrawMenufile(&mfl);
-		mfile_redraw = 0;
-	}
+   if (mfile_redraw)
+   {
+      WinDraw_DrawMenufile(&mfl);
+      mfile_redraw = 0;
+   }
 
-	if (menu_redraw) {
-		WinDraw_ClearMenuBuffer();
-		WinDraw_DrawMenu(menu_state, mkey_pos, mkey_y, mval_y);
-	}
+   if (menu_redraw)
+   {
+      WinDraw_ClearMenuBuffer();
+      WinDraw_DrawMenu(menu_state, mkey_pos, mkey_y, mval_y);
+   }
 
-	return 0;
+   return 0;
 }
